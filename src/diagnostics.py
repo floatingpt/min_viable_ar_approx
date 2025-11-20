@@ -30,7 +30,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from data.load_npy_dat import get_np_dir, load_test
-from train import vectorized_var_features
+from train import vectorized_var_features, select_var_order_bic
 
 
 def ensure_dirs():
@@ -71,7 +71,7 @@ def plot_roc(y_true, y_score, classes, out_path):
     plt.ylim([0.0, 1.05])
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Receiver Operating Characteristic")
+    plt.title("ROC Curve")
     plt.legend(loc="lower right")
     plt.tight_layout()
     plt.savefig(out_path)
@@ -157,6 +157,18 @@ def plot_calibration(y_true, y_score, classes, out_path, n_bins=10):
     plt.close()
     return calib_stats
 
+def plot_bic_distribution(p_values, out_path):
+    plt.figure(figsize=(6,4))
+    plt.hist(p_values, bins=np.arange(1, max(p_values)+2), edgecolor='black')
+    plt.xlabel("Selected VAR order p")
+    plt.ylabel("Count")
+    plt.title("Distribution of BIC-selected VAR orders")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+
 
 def coef_summary(clf, out_path):
     # For logistic regression, coef_ shape (n_classes, n_features) or (1, n_features)
@@ -184,6 +196,7 @@ def main():
     model = load(model_path)
     clf = model.get('clf', model if hasattr(model, 'predict') else None)
     pca = model.get('pca', None)
+    le = model.get('le', None)
     if clf is None:
         print('Failed to locate classifier in joblib file')
         return
@@ -191,10 +204,53 @@ def main():
     np_files = get_np_dir()
     x_test, y_test = load_test(np_files)
 
-    print('Computing VAR features for test set...')
-    Xf_test = vectorized_var_features(x_test, p=5, verbose=True)
+    # Decide which VAR order `p` to use for feature extraction.
+    # Prefer an explicit saved `p` in the model, otherwise try to infer it from the saved PCA input size.
+    saved_p = model.get('p', None)
+    inferred_p = None
+    n_ch = x_test.shape[1]
+    tri_len = n_ch * (n_ch + 1) // 2
     if pca is not None:
-        Xf_test_p = pca.transform(Xf_test)
+        n_in = getattr(pca, 'n_features_in_', None)
+        if n_in is not None:
+            # solve for p in: n_in = p*n_ch*n_ch + tri_len
+            residual = n_in - tri_len
+            if residual > 0 and residual % (n_ch * n_ch) == 0:
+                inferred_p = residual // (n_ch * n_ch)
+    if saved_p is not None:
+        p_used = saved_p
+        print(f"Using saved VAR order p={p_used} from model file")
+    elif inferred_p is not None:
+        p_used = inferred_p
+        print(f"Inferred VAR order p={p_used} from PCA input dimension")
+    else:
+        p_used = 5
+        print(f"No saved/inferred VAR order found; defaulting to p={p_used}")
+
+    print(f'Computing VAR features for test set with p={p_used}...')
+    Xf_test = vectorized_var_features(x_test, p=p_used, verbose=True)
+    if pca is not None:
+        # defensive check: ensure PCA was fitted on same number of features
+        n_in = getattr(pca, "n_features_in_", None)
+        if n_in is not None and n_in != Xf_test.shape[1]:
+            msg = (
+                f"PCA feature mismatch: saved PCA was fitted with {n_in} features, "
+                f"but current test features have {Xf_test.shape[1]} columns.\n"
+                "Likely cause: the model (and PCA) was trained with a different feature pipeline.\n"
+                "Recommended fix: re-run the training script `min_viable_ar_approx/src/train.py` so the saved PCA matches the current feature extractor.\n"
+            )
+            print(msg)
+            allow_refit = True
+            if allow_refit:
+                print("Warning: refitting PCA on test data (this causes data leakage). Re-fitting because allow_refit=True.")
+                from sklearn.decomposition import PCA as PCAnew
+                pca_new = PCAnew(n_components=min(getattr(pca, 'n_components_', getattr(pca, 'n_components', 2)), Xf_test.shape[1]))
+                Xf_test_p = pca_new.fit_transform(Xf_test)
+                pca = pca_new
+            else:
+                raise RuntimeError(msg + "If you understand the consequences and still want to proceed, set allow_refit=True in this script to auto-refit (not recommended).")
+        else:
+            Xf_test_p = pca.transform(Xf_test)
     else:
         Xf_test_p = Xf_test
 
@@ -209,9 +265,39 @@ def main():
         y_score = exp / exp.sum(axis=1, keepdims=True)
 
     y_pred = clf.predict(Xf_test_p)
-    classes = np.unique(np.concatenate([y_test, y_pred]))
+
+    # Encode / map test labels to the training label space
+    if le is not None:
+        try:
+            y_test_enc = le.transform(y_test)
+        except Exception:
+            # Best-effort mapping: if unique test labels count matches classes, map by order
+            uniq = np.unique(y_test)
+            if len(uniq) == len(clf.classes_):
+                mapping = {orig: enc for orig, enc in zip(uniq, clf.classes_)}
+                y_test_enc = np.array([mapping[v] for v in y_test])
+            else:
+                # try numeric coercion
+                try:
+                    y_test_enc = y_test.astype(int)
+                except Exception:
+                    raise RuntimeError('Could not map test labels to training label encoding. Retrain saving the LabelEncoder or provide matching labels.')
+    else:
+        # assume y_test already matches the encoding used in training
+        y_test_enc = y_test
+
+    classes = np.unique(np.concatenate([y_test_enc, y_pred]))
 
     results = {}
+    # If using BIC in training, recompute p-values for test set
+    p_vals = []
+    for Xi in x_test:
+        p_i, _ = select_var_order_bic(Xi, p_max=12)
+        p_vals.append(p_i)
+
+    results['bic_selected_orders'] = p_vals
+
+    plot_bic_distribution(p_vals, out_dir / 'bic_distribution.png')
     print('Plotting ROC...')
     results['roc_aucs'] = plot_roc(y_test, y_score, classes, out_dir / 'roc.png')
 

@@ -3,8 +3,8 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from joblib import dump
-from var_model import var_features_from_A_Var
 import scipy as sc
+from statsmodels.tsa.api import VAR
 import pandas as pd
 
 import os
@@ -19,6 +19,10 @@ except NameError:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from var_model import  fit_var_window, var_features_from_A_Var
+from collections import Counter
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.preprocessing import LabelEncoder
 from data.load_npy_dat import get_np_dir, load_train, load_test
 
 
@@ -55,40 +59,95 @@ def vectorized_var_fit(X_all, p=5, ridge=1e-6):    # (N, channels, T) -> (N, p, 
     B_resh = B.reshape(N, n, p, n).transpose(0, 2, 1, 3)
     A_all = B_resh.copy()
 
-    # residuals and var
-    # resid = Y - X_stack @ B  -> shape (N, T-p, n)
     resid = Y - np.matmul(X_stack, B)
-    # compute var = resid.T @ resid / (T-p)
+
+    # compute Var_all correctly per sample
+    # resid.transpose -> (N, n, T-p)
+    resid_t = resid.transpose(0, 2, 1)
+    Var_all = np.einsum('nti,ntj->nij', resid_t, resid_t) / (resid.shape[1])
+
     Var_all = np.einsum('nti,ntj->nij', resid, resid) / (Y.shape[1])
 
     return A_all, Var_all
 
 
-def vectorized_var_features(X_all, p=5, ridge=1e-6, verbose=True):
+
+
+def select_var_order_bic(X, p_max=12, ridge=1e-6):
+    """
+    Select VAR order p using BIC for a single sample X (channels x T).
+    """
+    _, n_channels = X.shape
+    T = X.shape[1]
+
+    bic_vals = []
+
+    for p in range(1, p_max + 1):
+
+        try:
+            # Fit VAR(p)
+            X_ = X.T  # statsmodels expects (T, n)
+            model = VAR(X_)
+            res = model.fit(maxlags=p, ic=None)
+            Sigma = res.sigma_u
+            used_p = res.k_ar
+        except Exception:
+            # fallback to manual LS
+            _, Sigma, used_p = vectorized_var_fit(X, p=p)
+
+        # Compute BIC score
+        logdet = np.log(np.linalg.det(Sigma) + 1e-12)
+        k = used_p * (n_channels ** 2)  # number of free parameters
+        bic = logdet + (k * np.log(T)) / T
+
+        bic_vals.append((p, bic))
+
+    # Choose best p
+    best_p = sorted(bic_vals, key=lambda x: x[1])[0][0]
+    return best_p, bic_vals
+
+
+
+
+
+
+
+def vectorized_var_features(X_all, p=5, use_bic=False, ridge=1e-6, verbose=True):
     """Compute VAR features (flattened A coeffs + logm(Var) upper-tri) for all samples."""
     N = X_all.shape[0]
     A_all, Var_all = vectorized_var_fit(X_all, p=p, ridge=ridge)
-
-    # flatten A: each sample -> concatenated A matrices (p * n * n)
-    n = A_all.shape[2]
-    coeffs = A_all.reshape(N, -1)
-
-    # compute logm of each siga
+    # compute per-sample VAR-derived features (use A_list + Var -> flattened per-sample feature)
     var_vecs = []
     for i in range(N):
-        try:
-            Slog = sc.linalg.logm(Var_all[i])
-        except Exception:
-            # fallback: log of diag variances
-            Slog = np.diag(np.log(np.diag(Var_all[i]) + 1e-12))
-        iu = np.triu_indices(n)
-        var_vecs.append(Slog[iu].real)
-        if verbose and (i % 1000 == 0):
+        A_list = A_all[i]
+        Sigma = Var_all[i]
+        feat_i = var_features_from_A_Var(A_list, Sigma)
+        var_vecs.append(feat_i)
+
+        if verbose and (i % 5000 == 0):
             print(f"logm processed {i}/{N}")
     var_vecs = np.vstack(var_vecs)
 
-    feats = np.hstack([coeffs.real, var_vecs.real])
+    # var_vecs already contains flattened A coefficients + sigma logm entries
+    feats = var_vecs.real
     return feats
+
+
+def select_global_var_order(X_all, p_max=8, sample_limit=200):
+    """Estimate per-sample BIC-selected p for a subset and return the modal p as global order."""
+    n = min(len(X_all), sample_limit)
+    p_list = []
+    for i in range(n):
+        try:
+            p_i, _ = select_var_order_bic(X_all[i], p_max=p_max)
+            p_list.append(p_i)
+        except Exception:
+            continue
+    if len(p_list) == 0:
+        return 5
+    most_common = Counter(p_list).most_common(1)[0][0]
+    return most_common
+
 
 if __name__ == "__main__": # create flag if loading does not work
     np_files = get_np_dir()
@@ -96,16 +155,21 @@ if __name__ == "__main__": # create flag if loading does not work
     x_test, y_test = load_test(np_files) # shape (7011,19,500)
 
     # feature extraction
-    # try to load labels from Excel documentation if available
+    # try to load labels and group ids from Excel documentation if available
     excel_path = PROJECT_ROOT / "data" / "Documentation" / "Seizures_Information.xlsx"
     if excel_path.exists():
         try:
             df = pd.read_excel(excel_path)
             # heuristics to find label column
             label_col = None
+            group_col = None
             for c in df.columns:
                 if any(k in c.lower() for k in ("seiz", "label", "state")):
                     label_col = c
+                    break
+            for c in df.columns:
+                if any(k in c.lower() for k in ("subject", "patient", "id", "record", "file", "rec", "recording")):
+                    group_col = c
                     break
             if label_col is not None:
                 if len(df) == len(x_train):
@@ -122,35 +186,67 @@ if __name__ == "__main__": # create flag if loading does not work
                     print(f"Found label column '{label_col}' but row count ({len(df)}) does not match train/test sizes; using .npy labels")
             else:
                 print(f"No obvious label column found in {excel_path}; using .npy labels")
+            groups_train = None
+            groups_test = None
+            if group_col is not None:
+                if len(df) == len(x_train):
+                    groups_train = df[group_col].values
+                    print(f"Loaded train groups from {excel_path} column '{group_col}'")
+                elif len(df) == len(x_test):
+                    groups_test = df[group_col].values
+                    print(f"Loaded test groups from {excel_path} column '{group_col}'")
+                elif len(df) == len(x_train) + len(x_test):
+                    groups_train = df[group_col].values[: len(x_train)]
+                    groups_test = df[group_col].values[len(x_train) :]
+                    print(f"Loaded combined groups from {excel_path} column '{group_col}'")
+                else:
+                    print(f"Found group column '{group_col}' but row count ({len(df)}) does not match train/test sizes; ignoring groups")
         except Exception as e:
             print(f"Failed to read {excel_path}: {e}; using .npy labels")
     else:
         print(f"No excel labels at {excel_path}; using .npy labels")
 
+    # choose VAR order: either fixed p or estimate a global p by BIC across training samples
+    use_global_bic = True
+    p = 5
+    if use_global_bic:
+        print("Estimating global VAR order using BIC on subset of training samples...")
+        p = select_global_var_order(x_train, p_max=8)
+        print(f"Selected global VAR order p={p}")
+
     print("Extracting train features (vectorized)...")
-    Xf_train = vectorized_var_features(x_train, p=5, verbose=True)
+    Xf_train = vectorized_var_features(x_train, p=p, verbose=True)
     print("Extracting test features (vectorized)...")
-    Xf_test = vectorized_var_features(x_test, p=5, verbose=True)
+    Xf_test = vectorized_var_features(x_test, p=p, verbose=True)
 
  
     from sklearn.decomposition import PCA
-    pca = PCA(n_components=200)  # tune this using elbow method later
+    pca = PCA(n_components=2)  # tune this using elbow method later
     Xf_train_p = pca.fit_transform(Xf_train) # pca w standarization
     Xf_test_p = pca.transform(Xf_test)
 
-    clf = LogisticRegression(max_iter=1000, multi_class='ovr') # 1vall log regression
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0) # 
-    scores = cross_val_score(clf, Xf_train_p, y_train, cv=cv, scoring='f1_macro')
-    print("CV macro-F1:", scores.mean(), scores.std())
+    # ensure labels numeric
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(y_train)
+    y_test_enc = le.transform(y_test)
 
-    clf.fit(Xf_train_p, y_train)
-    test_score = clf.score(Xf_test_p, y_test)
+    clf = LogisticRegression(max_iter=1000, multi_class='ovr', class_weight='balanced') # 1vall log regression
+    if 'groups_train' in locals() and groups_train is not None:
+        print("Using Leave-One-Group-Out CV based on groups from documentation")
+        logo = LeaveOneGroupOut()
+        scores = cross_val_score(clf, Xf_train_p, y_train_enc, cv=logo, groups=groups_train, scoring='f1_macro')
+    else:
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+        scores = cross_val_score(clf, Xf_train_p, y_train_enc, cv=cv, scoring='f1_macro')
+    print("CV macro-F1:", scores.mean(), scores.std())
+    clf.fit(Xf_train_p, y_train_enc)
+    test_score = clf.score(Xf_test_p, y_test_enc)
     print("Test score:", test_score)
     results_dir = PROJECT_ROOT / "results" # mkdir if none exists
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # save model + PCA
-    dump({"clf": clf, "pca": pca}, results_dir / "var_clf.joblib")
+    # save model + PCA + label encoder
+    dump({"clf": clf, "pca": pca, "le": le}, results_dir / "var_clf.joblib")
 
     # save metrics (CV mean/std and test score)
     import json
