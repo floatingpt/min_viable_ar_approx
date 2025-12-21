@@ -1,0 +1,3 @@
+project_root: /path/to/your/project
+raw_data_path: /path/to/your/project/siena-scalp-eeg-database-1.0.0
+features_path: /path/to/your/project/artifacts

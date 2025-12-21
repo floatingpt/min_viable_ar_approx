@@ -1,0 +1,3 @@
+project_root: /Users/jpxmaestas/Desktop/personal/physionet project/min_viable_ar_approx
+raw_data_path: /Users/jpxmaestas/Desktop/personal/physionet project/min_viable_ar_approx/siena-scalp-eeg-database-1.0.0
+features_path: /Users/jpxmaestas/Desktop/personal/physionet project/min_viable_ar_approx/artifacts
